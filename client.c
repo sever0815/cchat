@@ -8,8 +8,10 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,8 +34,8 @@
 /* DEFAULT_PORT используется при добавлении нового сервера.                  */
 /* ========================================================================== */
 
-#define DEFAULT_PORT  5555
-#define SHARED_SECRET "CHANGE-ME-cchat-shared-secret-please-32-bytes-minimum"
+#define DEFAULT_PORT  5050
+#define SHARED_SECRET "YourKey"
 
 #define CLIENT_DIR_NAME ".cchat"
 #define MAX_SERVERS     256
@@ -600,90 +602,202 @@ out:
 /* Чат                                                                       */
 /* ------------------------------------------------------------------------- */
 
+typedef struct {
+    int fd;
+    cc_conn_t *conn;
+    const char *hist_path;
+    uint8_t key[CC_KEY_LEN];
+    atomic_int running;
+    pthread_mutex_t out_mu;
+    int prompt_visible;
+    int wake_fd;
+} chat_state;
+
+static void chat_prompt(chat_state *st)
+{
+    pthread_mutex_lock(&st->out_mu);
+    if (atomic_load(&st->running) && !st->prompt_visible) {
+        fputs("> ", stdout);
+        fflush(stdout);
+        st->prompt_visible = 1;
+    }
+    pthread_mutex_unlock(&st->out_mu);
+}
+
+/*
+ * Выводит строку, не ломая приглашение "> ". Если приглашение уже было
+ * напечатано, сначала очищает эту строку терминала и затем печатает
+ * приглашение заново.
+ */
+static void chat_emit(chat_state *st, const char *text)
+{
+    pthread_mutex_lock(&st->out_mu);
+
+    if (st->prompt_visible) {
+        if (isatty(STDOUT_FILENO))
+            fputs("\r\033[K", stdout);
+        else
+            fputc('\n', stdout);
+        st->prompt_visible = 0;
+    }
+
+    fputs(text, stdout);
+
+    if (atomic_load(&st->running)) {
+        fputs("> ", stdout);
+        st->prompt_visible = 1;
+    }
+    fflush(stdout);
+
+    pthread_mutex_unlock(&st->out_mu);
+}
+
+static void *chat_receiver_thread(void *arg)
+{
+    chat_state *st = (chat_state *)arg;
+    char packet[8192];
+    char out[8448];
+
+    while (atomic_load(&st->running)) {
+        ssize_t n = cc_conn_recv(st->conn, packet, sizeof(packet));
+
+        if (n <= 0) {
+            if (atomic_load(&st->running)) {
+                atomic_store(&st->running, 0);
+                chat_emit(st, "Соединение с сервером закрыто.\n");
+                if (st->wake_fd >= 0) {
+                    char c = 'x';
+                    (void)write(st->wake_fd, &c, 1);
+                }
+            }
+            break;
+        }
+
+        if (strncmp(packet, "CHAT\t", 5) == 0) {
+            char *t1 = strchr(packet + 5, '\t');
+
+            if (t1 != NULL) {
+                char *t2;
+                *t1 = '\0';
+                t2 = strchr(t1 + 1, '\t');
+                if (t2 != NULL) {
+                    const char *nick = packet + 5;
+                    const char *ts = t1 + 1;
+                    const char *text = t2 + 1;
+                    int m;
+
+                    *t2 = '\0';
+                    m = snprintf(out, sizeof(out), "[%s] %s: %s\n",
+                                 ts, nick, text);
+                    if (m > 0 && (size_t)m < sizeof(out))
+                        chat_emit(st, out);
+
+                    if (cc_history_append(st->hist_path, st->key,
+                                          nick, ts, text) != 0) {
+                        chat_emit(st, "(не удалось сохранить сообщение "
+                                      "в локальную историю)\n");
+                    }
+                }
+            }
+        } else if (strncmp(packet, "ERR\t", 4) == 0) {
+            snprintf(out, sizeof(out), "Ошибка сервера: %s\n", packet + 4);
+            chat_emit(st, out);
+        } else if (strcmp(packet, "PONG") != 0) {
+            snprintf(out, sizeof(out), "%s\n", packet);
+            chat_emit(st, out);
+        }
+    }
+
+    return NULL;
+}
+
 static void chat_loop(int fd, cc_conn_t *conn, const server_entry *srv,
                       const char *username)
 {
     char hist_path[4096];
-    uint8_t key[CC_KEY_LEN];
     char *input = NULL;
     size_t input_cap = 0;
-    int prompt_shown = 0;
-    int tty = isatty(STDIN_FILENO);
+    int wake_pipe[2] = { -1, -1 };
+    pthread_t receiver;
+    int receiver_started = 0;
+    chat_state st;
 
     history_path(srv, hist_path, sizeof(hist_path));
+    memset(&st, 0, sizeof(st));
+    st.fd = fd;
+    st.conn = conn;
+    st.hist_path = hist_path;
+    st.wake_fd = -1;
+    st.prompt_visible = 0;
+    atomic_init(&st.running, 1);
     cc_derive_key((const uint8_t *)SHARED_SECRET, strlen(SHARED_SECRET),
-                  "cchat-file-v1", key);
+                  "cchat-file-v1", st.key);
+
+    if (pthread_mutex_init(&st.out_mu, NULL) != 0) {
+        printf("Не удалось инициализировать чат.\n");
+        memset(st.key, 0, sizeof(st.key));
+        return;
+    }
+    if (pipe(wake_pipe) == 0) {
+        st.wake_fd = wake_pipe[1];
+    }
 
     printf("\n=== ЧАТ: %s (%s:%d) ===\n", srv->name, srv->host, srv->port);
     printf("Вы вошли как %s. /quit — выход, /help — помощь.\n\n", username);
 
+    /*
+     * Приём сообщений работает в отдельном потоке. Поэтому входящие
+     * сообщения видны сразу, даже пока основной поток ждёт ввода строки.
+     */
+    if (pthread_create(&receiver, NULL, chat_receiver_thread, &st) != 0) {
+        printf("Не удалось запустить поток приёма сообщений.\n");
+        goto cleanup;
+    }
+    receiver_started = 1;
+
     for (;;) {
         struct pollfd pfd[2];
+        nfds_t nfds = 1;
         int pr;
 
-        if (!prompt_shown) {
-            printf("> ");
-            fflush(stdout);
-            prompt_shown = 1;
-        }
+        if (!atomic_load(&st.running))
+            break;
 
-        pfd[0].fd = fd;
+        chat_prompt(&st);
+
+        pfd[0].fd = STDIN_FILENO;
         pfd[0].events = POLLIN;
         pfd[0].revents = 0;
-        pfd[1].fd = STDIN_FILENO;
-        pfd[1].events = POLLIN;
-        pfd[1].revents = 0;
+        if (wake_pipe[0] >= 0) {
+            pfd[1].fd = wake_pipe[0];
+            pfd[1].events = POLLIN;
+            pfd[1].revents = 0;
+            nfds = 2;
+        }
 
-        pr = poll(pfd, 2, -1);
+        pr = poll(pfd, nfds, -1);
         if (pr < 0) {
             if (errno == EINTR)
                 continue;
-            printf("\nОшибка poll: %s\n", strerror(errno));
+            chat_emit(&st, "Ошибка ожидания ввода.\n");
+            break;
+        }
+
+        if (nfds == 2 &&
+            (pfd[1].revents & (POLLIN | POLLHUP | POLLERR)) != 0) {
             break;
         }
 
         if ((pfd[0].revents & (POLLIN | POLLHUP | POLLERR)) != 0) {
-            char packet[8192];
-            ssize_t n = cc_conn_recv(conn, packet, sizeof(packet));
+            ssize_t len;
+            char *msg;
+            size_t need;
 
-            if (n <= 0) {
-                if (tty)
-                    printf("\r\033[K");
-                printf("Соединение с сервером закрыто.\n");
-                break;
-            }
+            pthread_mutex_lock(&st.out_mu);
+            st.prompt_visible = 0;
+            pthread_mutex_unlock(&st.out_mu);
 
-            if (tty && prompt_shown)
-                printf("\r\033[K");
-            prompt_shown = 0;
-
-            if (strncmp(packet, "CHAT\t", 5) == 0) {
-                char *t1 = strchr(packet + 5, '\t');
-                if (t1 != NULL) {
-                    char *t2;
-                    *t1 = '\0';
-                    t2 = strchr(t1 + 1, '\t');
-                    if (t2 != NULL) {
-                        const char *nick = packet + 5;
-                        const char *ts = t1 + 1;
-                        const char *text = t2 + 1;
-                        *t2 = '\0';
-                        printf("[%s] %s: %s\n", ts, nick, text);
-                        if (cc_history_append(hist_path, key, nick, ts, text) != 0)
-                            printf("(не удалось сохранить сообщение в локальную историю)\n");
-                    }
-                }
-            } else if (strncmp(packet, "ERR\t", 4) == 0) {
-                printf("Ошибка сервера: %s\n", packet + 4);
-            } else if (strcmp(packet, "PONG") != 0) {
-                printf("%s\n", packet);
-            }
-        }
-
-        if ((pfd[1].revents & (POLLIN | POLLHUP | POLLERR)) != 0) {
-            ssize_t len = getline(&input, &input_cap, stdin);
-            prompt_shown = 0;
-
+            len = getline(&input, &input_cap, stdin);
             if (len < 0) {
                 (void)cc_conn_send(conn, "QUIT", 4);
                 break;
@@ -699,35 +813,50 @@ static void chat_loop(int fd, cc_conn_t *conn, const server_entry *srv,
                 break;
             }
             if (strcmp(input, "/help") == 0) {
-                printf("Введите сообщение и нажмите Enter. /quit — выход.\n");
+                chat_emit(&st, "Введите сообщение и нажмите Enter. "
+                               "/quit — выход.\n");
                 continue;
             }
             if (strlen(input) > CC_MAX_MESSAGE) {
-                printf("Сообщение длиннее %d байт и не отправлено.\n",
-                       CC_MAX_MESSAGE);
+                char notice[128];
+                snprintf(notice, sizeof(notice),
+                         "Сообщение длиннее %d байт и не отправлено.\n",
+                         CC_MAX_MESSAGE);
+                chat_emit(&st, notice);
                 continue;
             }
 
-            {
-                size_t need = strlen(input) + 5;
-                char *msg = (char *)malloc(need);
-                if (msg == NULL) {
-                    printf("Не хватает памяти.\n");
-                    continue;
-                }
-                snprintf(msg, need, "MSG\t%s", input);
-                if (cc_conn_send(conn, msg, strlen(msg)) != 0) {
-                    free(msg);
-                    printf("Не удалось отправить сообщение.\n");
-                    break;
-                }
-                free(msg);
+            need = strlen(input) + 5;
+            msg = (char *)malloc(need);
+            if (msg == NULL) {
+                chat_emit(&st, "Не хватает памяти.\n");
+                continue;
             }
+            snprintf(msg, need, "MSG\t%s", input);
+            if (cc_conn_send(conn, msg, strlen(msg)) != 0) {
+                free(msg);
+                chat_emit(&st, "Не удалось отправить сообщение.\n");
+                break;
+            }
+            free(msg);
         }
     }
 
+cleanup:
+    atomic_store(&st.running, 0);
+    shutdown(fd, SHUT_RDWR);
+    if (receiver_started)
+        pthread_join(receiver, NULL);
+
+    if (wake_pipe[0] >= 0)
+        close(wake_pipe[0]);
+    if (wake_pipe[1] >= 0)
+        close(wake_pipe[1]);
+
     free(input);
-    memset(key, 0, sizeof(key));
+    memset(st.key, 0, sizeof(st.key));
+    pthread_mutex_destroy(&st.out_mu);
+    fputc('\n', stdout);
 }
 
 /* ------------------------------------------------------------------------- */

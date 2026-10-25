@@ -30,8 +30,8 @@
 /* вручную при добавлении сервера в клиенте).                                */
 /* ========================================================================== */
 
-#define SERVER_PORT   5555
-#define SHARED_SECRET "CHANGE-ME-cchat-shared-secret-please-32-bytes-minimum"
+#define SERVER_PORT   5050
+#define SHARED_SECRET "YourKey"
 
 #define DATA_DIR     "data"
 #define USERS_FILE   DATA_DIR "/users.db"
@@ -563,11 +563,71 @@ static int create_listen_socket(void)
     return fd;
 }
 
-int main(void)
+static int daemonize_process(void)
+{
+    pid_t pid;
+    int fd;
+
+    pid = fork();
+    if (pid < 0)
+        return -1;
+    if (pid > 0)
+        _exit(0);
+
+    if (setsid() < 0)
+        return -1;
+
+    pid = fork();
+    if (pid < 0)
+        _exit(1);
+    if (pid > 0)
+        _exit(0);
+
+    /* Рабочий каталог не меняем: data/ остаётся рядом с бинарником. */
+    fd = open("/dev/null", O_RDWR);
+    if (fd < 0)
+        return -1;
+    if (dup2(fd, STDIN_FILENO) < 0 ||
+        dup2(fd, STDOUT_FILENO) < 0 ||
+        dup2(fd, STDERR_FILENO) < 0) {
+        close(fd);
+        return -1;
+    }
+    if (fd > STDERR_FILENO)
+        close(fd);
+
+    return 0;
+}
+
+static void print_server_usage(const char *argv0)
+{
+    printf("Использование:\n");
+    printf("  %s            — запуск в терминале\n", argv0);
+    printf("  %s -d         — запуск в фоне без вывода в терминал\n", argv0);
+    printf("  %s --daemon   — то же самое\n", argv0);
+    printf("  %s --help     — эта справка\n", argv0);
+}
+
+int main(int argc, char **argv)
 {
     int listen_fd;
+    int daemon_mode = 0;
     uint8_t fingerprint[32];
     char fp_hex[17];
+    int i;
+
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--daemon") == 0) {
+            daemon_mode = 1;
+        } else if (strcmp(argv[i], "-h") == 0 ||
+                   strcmp(argv[i], "--help") == 0) {
+            print_server_usage(argv[0]);
+            return 0;
+        } else {
+            print_server_usage(argv[0]);
+            return 1;
+        }
+    }
 
     signal(SIGPIPE, SIG_IGN);
 
@@ -578,15 +638,22 @@ int main(void)
     if (listen_fd < 0)
         return 1;
 
-    cc_sha256(SHARED_SECRET, strlen(SHARED_SECRET), fingerprint);
-    cc_hex_encode(fingerprint, 8, fp_hex);
+    if (daemon_mode) {
+        if (daemonize_process() != 0) {
+            fprintf(stderr, "Не удалось уйти в фон\n");
+            return 1;
+        }
+    } else {
+        cc_sha256(SHARED_SECRET, strlen(SHARED_SECRET), fingerprint);
+        cc_hex_encode(fingerprint, 8, fp_hex);
 
-    printf("CCHAT server запущен\n");
-    printf("Порт: %d\n", SERVER_PORT);
-    printf("Данные: %s/\n", DATA_DIR);
-    printf("Отпечаток ключа: %s (должен совпадать с клиентом)\n", fp_hex);
-    printf("Ожидание подключений...\n");
-    fflush(stdout);
+        printf("CCHAT server запущен\n");
+        printf("Порт: %d\n", SERVER_PORT);
+        printf("Данные: %s/\n", DATA_DIR);
+        printf("Отпечаток ключа: %s (должен совпадать с клиентом)\n", fp_hex);
+        printf("Ожидание подключений...\n");
+        fflush(stdout);
+    }
 
     for (;;) {
         struct sockaddr_in peer;
