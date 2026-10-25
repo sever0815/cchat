@@ -1,0 +1,4 @@
+cchat
+cchat-server
+*.o
+data/
